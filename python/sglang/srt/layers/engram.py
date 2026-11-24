@@ -1359,6 +1359,10 @@ class EngramEmbedding(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.host_table: Optional[_HostTable] = None
         self._offload_backend: Optional[EngramTableBackend] = None
+        # Engram.forward reads it before every lookup. The NPU offload route
+        # never stages: its enable_scheduler_staging assert requires a
+        # host_table, which the acc_offload pool does not use.
+        self.staged_by_scheduler = False
         config = resolve_engram_config(len(column_bounds) - 1)
         if config.placement == EngramPlacement.CPU and is_npu():
             if _npu_offload_supported():
@@ -1371,7 +1375,6 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self._sort_host_reads = False
-        self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
