@@ -45,11 +45,11 @@ from sglang.srt.environ import envs
 # offloaded lookup must stay bit-identical to it (and to the GPU gather
 # kernel), which a reimplementation would drift from.
 from sglang.srt.layers.engram import EngramLayout, _e8m0_to_float
-from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
     memfabric_host_memory_enabled,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
-from sglang.srt.utils.common import is_device_stream_capturing
+from sglang.srt.utils.device import is_device_stream_capturing
 
 logger = logging.getLogger(__name__)
 
