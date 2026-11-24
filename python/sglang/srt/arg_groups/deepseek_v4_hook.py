@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.engram_config import (
     EngramConfig,
     EngramLookup,
+    EngramPlacement,
     EngramReplication,
     cols_per_rank,
 )
@@ -77,6 +79,15 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
             raise ValueError("--engram-config applies to DeepSeek-V4.1 only.")
         return
     config = EngramConfig() if raw is None else EngramConfig.from_dict(raw)
+    if config.placement == EngramPlacement.NPU:
+        if not is_npu():
+            raise ValueError(
+                "--engram-config: placement 'npu' needs an NPU server (the "
+                "memfabric acc_offload host pool)."
+            )
+        # One placement value for the layer routing: 'npu' is the NPU spelling
+        # of the 'cpu' host offload.
+        config = dataclasses.replace(config, placement=EngramPlacement.CPU)
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
     if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (

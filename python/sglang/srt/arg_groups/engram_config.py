@@ -8,7 +8,11 @@ from typing import Any, Dict, Optional
 class EngramPlacement:
     GPU = "gpu"
     CPU = "cpu"
-    ALL = (GPU, CPU)
+    # NPU spelling of 'cpu': the tables take the memfabric acc_offload host
+    # pool. _resolve_engram_config requires an NPU server and rewrites it to
+    # CPU, so the layer routing sees one value.
+    NPU = "npu"
+    ALL = (GPU, CPU, NPU)
 
 
 class EngramReplication:
@@ -67,6 +71,11 @@ class EngramConfig:
             )
         config = cls(**raw)
         if config.replication == EngramReplication.GROUP_SHARDS:
+            if config.placement == EngramPlacement.NPU:
+                raise ValueError(
+                    "--engram-config: replication 'group_shards' reads the "
+                    "shards in place; it does not apply to placement 'npu'."
+                )
             if config.lookup not in (EngramLookup.AUTO, EngramLookup.PEER_READ):
                 raise ValueError(
                     "--engram-config: replication 'group_shards' reads the shards "
@@ -95,9 +104,10 @@ class EngramConfig:
             )
         if (
             config.replication == EngramReplication.PER_NODE
-            and config.placement != EngramPlacement.CPU
+            and config.placement not in (EngramPlacement.CPU, EngramPlacement.NPU)
         ):
             raise ValueError(
-                "--engram-config: replication 'per_node' needs placement 'cpu'."
+                "--engram-config: replication 'per_node' needs placement 'cpu' "
+                "(or 'npu' on an NPU server)."
             )
         return config

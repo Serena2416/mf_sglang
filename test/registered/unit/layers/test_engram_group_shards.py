@@ -36,6 +36,42 @@ class TestEngramGroupShardsConfig(CustomTestCase):
                 EngramConfig.from_dict(raw)
 
 
+class TestEngramPlacementNPU(CustomTestCase):
+    """'npu' is the NPU spelling of the 'cpu' host offload; _resolve_engram_config
+    turns it into CPU on an NPU server, so only the parsing rules live here."""
+
+    def test_npu_placement_parses_and_tracks_cpu_rules(self):
+        config = EngramConfig.from_dict({"placement": "npu"})
+        self.assertEqual(config.placement, "npu")
+        # The NPU acc_offload pool is always node-shared, so per_node rides along.
+        self.assertEqual(
+            EngramConfig.from_dict(
+                {"placement": "npu", "replication": "per_node"}
+            ).replication,
+            "per_node",
+        )
+
+    def test_npu_placement_rejects_gpu_shard_readers(self):
+        # peer_read reads the shards in place and needs placement 'gpu';
+        # group_shards resolves to peer_read, so npu rejects both.
+        for raw, pattern in (
+            ({"placement": "npu", "lookup": "peer_read"}, "peer_read"),
+            (
+                {
+                    "placement": "npu",
+                    "replication": "group_shards",
+                    "group_size": 4,
+                    "group_store": "/s",
+                },
+                "group_shards",
+            ),
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                ValueError, pattern
+            ):
+                EngramConfig.from_dict(raw)
+
+
 class TestEngramGroupStore(CustomTestCase):
     def test_concurrent_claims_get_unique_slots(self):
         world = 4
