@@ -10,9 +10,9 @@ gathers the selected rows with the acc_offload entry_gather AIV kernel over a
 slot-segmented layout: each rank's slot holds the row chunks back to back
 from the slot start (row pitch = engram head dim, no padding) and whatever
 the slot cannot hold stays empty at its tail, which the kernel addressing
-strides over. Neither the pool nor the kernel interprets the row width —
-the per-layer layout is registered once after init
-(offload_register_entry_table) and the gather call carries only the table id.
+strides over. One uniform grid is registered for the whole slot after init.
+Before gather, layer row ids are encoded with the owner slot and layer offset;
+the MemFabric call takes only dst, encoded ids, count and device.
 The e8m0 scale tables are 128x smaller and stay resident on the device.
 
 This module is NPU-only and lives under hardware_backend/npu on purpose; the
@@ -91,14 +91,12 @@ class EngramOffloadTable:
     Row `i` of the layer table lives at
     `pool_base + block_offset + (i // rows) * slot + (i % rows) * entry_bytes`
     — chunk rank is the node-local rank, the slot stride hops over each
-    slot's tail gap, and the kernel resolves the mapping from the registered
-    layout, so forward passes the raw hash row ids through.
+    slot's tail gap. Forward folds the layer offset into the uniform-grid ids.
     """
 
     layer_hash_index: int
     num_embeddings: int
     head_dim: int
-    table_id: int  # handle from register_entry_table
     # host view of this rank's chunk, [rows, entry_bytes] uint8
     pool_weight: torch.Tensor
     # chunk rows per slot (ceil sharding; the last chunk's tail is unused)
@@ -127,16 +125,22 @@ class EngramOffloadManager:
         self.rank = rank
         self.slot = slot
         self._tables = tables
+        self.rows_per_slot = sum(table.rows for table in tables)
+
+    def encode_ids(self, ids: torch.Tensor, table: EngramOffloadTable) -> torch.Tensor:
+        return (
+            (ids // table.rows) * self.rows_per_slot
+            + table.block_offset // table.entry_bytes
+            + ids % table.rows
+        )
 
     def table(self, layer_hash_index: int) -> EngramOffloadTable:
         return self._tables[layer_hash_index]
 
-    def entry_gather(
-        self, dst, ids: torch.Tensor, count, table_id: int, device: torch.device
-    ) -> int:
+    def entry_gather(self, dst, ids: torch.Tensor, count, device: torch.device) -> int:
         """Async gather on the current NPU stream; ordering with the following
         dequant ops comes from the stream itself."""
-        return self._entity.entry_gather(dst, ids, count, table_id, device)
+        return self._entity.entry_gather(dst, ids, count, device)
 
     def uninitialize(self) -> None:
         logger.info(
@@ -304,30 +308,27 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
             "exhausted for the engram pool"
         )
 
+    ret = entity.register_entry_table(entry_bytes, used // entry_bytes)
+    if ret != 0:
+        raise RuntimeError(f"[engram_offload] register_entry_table failed ({ret})")
+
     tables = []
     for layer_hash_index, (block_offset, rows, num_embeddings) in enumerate(chunks):
-        table_id = entity.register_entry_table(entry_bytes, rows, block_offset)
-        assert table_id == layer_hash_index, (
-            f"table id {table_id} diverged from registration order "
-            f"{layer_hash_index}; every rank must register the same layouts"
-        )
         logger.info(
             "[engram_offload] rank %d: registered table %d (E=%d "
-            "rows_per_slot=%d block_off=%d entry=%dB table_id=%d)",
+            "rows_per_slot=%d block_off=%d entry=%dB)",
             rank,
             layer_hash_index,
             num_embeddings,
             rows,
             block_offset,
             entry_bytes,
-            table_id,
         )
         tables.append(
             EngramOffloadTable(
                 layer_hash_index=layer_hash_index,
                 num_embeddings=num_embeddings,
                 head_dim=layout.head_dim,
-                table_id=table_id,
                 pool_weight=_host_tensor(
                     slot_base + block_offset, (rows, entry_bytes), torch.uint8
                 ),
@@ -431,7 +432,7 @@ class NpuEngramOffloadBackend:
         self._scale = embed.scale
         logger.info(
             "[engram_offload] rank %d: layer %d OFFLOAD mode engaged "
-            "(E=%d chunk_rows=%d entry=%dB block_off=%d table_id=%d; "
+            "(E=%d chunk_rows=%d entry=%dB block_off=%d; "
             "weight meta + pinned staging, fp8 weight + scale device-resident)",
             self._manager.rank,
             self._layer_hash_index,
@@ -439,7 +440,6 @@ class NpuEngramOffloadBackend:
             self.rows,
             self._table.entry_bytes,
             self._table.block_offset,
-            self._table.table_id,
         )
 
     def _load_weight_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -567,25 +567,24 @@ class NpuEngramOffloadBackend:
         # ids as a flat array. copy_ needs matching shapes (it broadcasts, it
         # does not reinterpret), hence viewing the flat prefix as [T, H]; the
         # strided source is still handled in one d2d pass.
-        buffers.ids[:count].view(indices.shape).copy_(indices)
+        encoded = self._manager.encode_ids(indices, self._table)
+        buffers.ids[:count].view(indices.shape).copy_(encoded)
         buffers.count.fill_(count)
         self._calls += 1
         if self._calls == 1 or self._calls % _OFFLOAD_LOG_EVERY == 0:
             logger.info(
                 "[engram_offload] rank %d: layer %d entry_gather call #%d "
-                "(%d ids, table_id=%d, capacity=%d)",
+                "(%d ids, capacity=%d)",
                 self._manager.rank,
                 self._layer_hash_index,
                 self._calls,
                 count,
-                self._table.table_id,
                 buffers.capacity,
             )
         ret = self._manager.entry_gather(
             buffers.staging,
             buffers.ids,
             buffers.count,
-            self._table.table_id,
             indices.device,
         )
         if ret != 0:

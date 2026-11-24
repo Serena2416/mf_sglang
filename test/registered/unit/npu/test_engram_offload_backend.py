@@ -112,17 +112,18 @@ class _FakeOffloadEntity:
         assert self._buf is not None and size <= self._slot
         return ctypes.addressof(self._buf) + self._config.rank_id * self._slot
 
-    def register_entry_table(self, entry_bytes, rows, block_offset):
-        self._tables.append((entry_bytes, rows, block_offset))
-        return len(self._tables) - 1
+    def register_entry_table(self, entry_bytes, rows):
+        assert not self._tables, "only one uniform grid may be registered"
+        self._tables.append((entry_bytes, rows))
+        return 0
 
-    def entry_gather(self, dst, ids, count, table_id, device):
-        entry_bytes, rows, block_offset = self._tables[table_id]
+    def entry_gather(self, dst, ids, count, device):
+        entry_bytes, rows = self._tables[0]
         n = int(count) if not torch.is_tensor(count) else int(count.item())
         dst_np = dst.numpy()
         for j, row in enumerate(ids[:n].to(torch.int64).cpu().tolist()):
             slot_i, in_slot = divmod(row, rows)
-            start = slot_i * self._slot + block_offset + in_slot * entry_bytes
+            start = slot_i * self._slot + in_slot * entry_bytes
             dst_np[j * entry_bytes : (j + 1) * entry_bytes] = np.frombuffer(
                 self._buf, dtype=np.uint8, count=entry_bytes, offset=start
             )
@@ -242,7 +243,7 @@ def _write_all_chunks(entity, manager, table, src_u8: np.ndarray) -> None:
             break
         start = chunk_rank * manager.slot + table.block_offset
         n = (hi - lo) * table.entry_bytes
-        pool[start : start + n] = src_u8[
+        pool[start : start + n] = src_u8.reshape(-1)[
             lo * table.entry_bytes : hi * table.entry_bytes
         ].reshape(-1)
 
@@ -256,7 +257,7 @@ def _pool_rows(entity, manager, table, ids: torch.Tensor) -> torch.Tensor:
         slot_i, in_slot = divmod(row, table.rows)
         start = slot_i * manager.slot + table.block_offset + in_slot * table.entry_bytes
         out[j] = pool[start : start + table.entry_bytes]
-    return torch.from_numpy(out)
+    return torch.from_numpy(out).reshape(*ids.shape, table.entry_bytes)
 
 
 def _dequant_ref(weight_u8: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
@@ -294,6 +295,7 @@ class TestPoolOpenAndAddressing(CustomTestCase):
             self.assertEqual((t1.rows, t1.block_offset), (176, 250 * _HEAD_DIM))
             self.assertEqual(manager.slot, _SLOT_GIB)
             self.assertEqual(t0.entry_bytes, _HEAD_DIM)
+            self.assertEqual(manager._entity._tables, [(_HEAD_DIM, 426)])
 
             # every row of both tables, gathered back through the fake kernel,
             # matches the source bytes: covers chunk boundaries (249/250,
@@ -314,9 +316,8 @@ class TestPoolOpenAndAddressing(CustomTestCase):
                 self.assertEqual(
                     manager.entry_gather(
                         staging,
-                        ids,
+                        manager.encode_ids(ids, table),
                         torch.tensor(e, dtype=torch.int32),
-                        ti,
                         torch.device("cpu"),
                     ),
                     0,
@@ -375,7 +376,7 @@ class TestPoolCoords(CustomTestCase):
                 (8, 3),
             ),
             ({"LOCAL_WORLD_SIZE": "4", "LOCAL_RANK": "2"}, (4, 2)),
-            (None, (4, 3)),
+            (None, (4, 0)),
         ]
         for env, expected in cases:
             with self.subTest(env=env):
@@ -446,17 +447,12 @@ class TestFailFastSurface(CustomTestCase):
                 _open_manager()
             self.assertIn("host DRAM", str(cm.exception))
 
-    def test_table_id_drift_fails_fast(self):
+    def test_registration_failure_fails_fast(self):
         with _OffloadHarness(multi_instance=False, node_local_env=_WORLD_ENV) as h:
-            original = h.module.offload.register_entry_table
-
-            def drifting_register(entry_bytes, rows, block_offset):
-                return original(entry_bytes, rows, block_offset) + 100
-
-            h.module.offload.register_entry_table = drifting_register
-            with self.assertRaises(AssertionError) as cm:
+            h.module.offload.register_entry_table = lambda entry_bytes, rows: -1
+            with self.assertRaises(RuntimeError) as cm:
                 _open_manager()
-            self.assertIn("diverged", str(cm.exception))
+            self.assertIn("register_entry_table failed", str(cm.exception))
 
     def test_oversized_row_fails_fast(self):
         layout = EngramLayout(
@@ -540,7 +536,8 @@ class TestBackendLifecycle(CustomTestCase):
             n = backend.rows * backend._table.entry_bytes
             expected = (
                 full.view(torch.uint8)
-                .numpy()[
+                .numpy()
+                .reshape(-1)[
                     backend.row_start * _HEAD_DIM : (backend.row_start + backend.rows)
                     * _HEAD_DIM
                 ]
