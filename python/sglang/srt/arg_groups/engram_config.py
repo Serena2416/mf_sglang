@@ -8,9 +8,8 @@ from typing import Any, Dict, Optional
 class EngramPlacement:
     GPU = "gpu"
     CPU = "cpu"
-    # NPU spelling of 'cpu': the tables take the memfabric acc_offload host
-    # pool. _resolve_engram_config requires an NPU server and rewrites it to
-    # CPU, so the layer routing sees one value.
+    # NPU spelling of 'cpu' (the memfabric acc_offload host pool);
+    # _resolve_engram_config validates the server and rewrites it to CPU.
     NPU = "npu"
     ALL = (GPU, CPU, NPU)
 

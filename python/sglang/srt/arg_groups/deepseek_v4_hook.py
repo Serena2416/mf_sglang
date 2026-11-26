@@ -85,8 +85,8 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
                 "--engram-config: placement 'npu' needs an NPU server (the "
                 "memfabric acc_offload host pool)."
             )
-        # One placement value for the layer routing: 'npu' is the NPU spelling
-        # of the 'cpu' host offload.
+        # 'npu' is the NPU spelling of 'cpu': rewrite so the layer routing
+        # sees one value.
         config = dataclasses.replace(config, placement=EngramPlacement.CPU)
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")

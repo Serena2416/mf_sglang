@@ -1360,14 +1360,13 @@ class EngramEmbedding(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.host_table: Optional[_HostTable] = None
         self._offload_backend: Optional[EngramTableBackend] = None
-        # Engram.forward reads it before every lookup. The NPU offload route
-        # never stages: its enable_scheduler_staging assert requires a
-        # host_table, which the acc_offload pool does not use.
+        # Engram.forward reads it before every lookup; the offload route never
+        # stages (enable_scheduler_staging asserts a host_table).
         self.staged_by_scheduler = False
         config = resolve_engram_config(len(column_bounds) - 1)
-        # INT8 checkpoint tables, validated before any routing so a host
-        # placement (the NPU offload route included: the hook rewrites 'npu'
-        # to CPU) is rejected instead of silently routed.
+        # Validated before any routing so a host placement (the NPU offload
+        # route included: the hook rewrites 'npu' to CPU) is rejected, not
+        # silently routed.
         int8_storage = storage is not None
         if int8_storage:
             if mxfp4:

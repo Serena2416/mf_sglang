@@ -15,9 +15,8 @@ Before gather, layer row ids are encoded with the owner slot and layer offset;
 the MemFabric call takes only dst, encoded ids, count and device.
 The e8m0 scale tables are 128x smaller and stay resident on the device.
 
-This module is NPU-only and lives under hardware_backend/npu on purpose; the
-shared framework (sglang.srt.layers.engram.EngramEmbedding) reaches it through
-the EngramTableBackend protocol with a function-level import.
+The shared framework (sglang.srt.layers.engram.EngramEmbedding) reaches this
+backend through the EngramTableBackend protocol with a function-level import.
 
 The pool is reserved and the layouts registered once per process, identically
 on every rank (model build order is rank-uniform), which is what lets the NPU
@@ -42,8 +41,7 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
 from sglang.srt.environ import envs
 
 # The dequant helper is shared with the device-resident path on purpose: the
-# offloaded lookup must stay bit-identical to it (and to the GPU gather
-# kernel), which a reimplementation would drift from.
+# offloaded lookup must stay bit-identical to it (and to the GPU gather kernel).
 from sglang.srt.layers.engram import EngramLayout, _e8m0_to_float
 from sglang.srt.mem_cache.pool_host.npu_host_memory import (
     memfabric_host_memory_enabled,
@@ -59,8 +57,7 @@ _GIB = 1 << 30
 _MAX_ENTRY_BYTES = 120 * 1024
 # The share pool holds at most 16 node-local ranks.
 _MAX_LOCAL_WORLD = 16
-# Heartbeat interval for the per-forward lookup logs (the first call is always
-# logged); keeps the decode hot path quiet while still proving liveness.
+# Heartbeat for the per-forward lookup logs; the first call is always logged.
 _OFFLOAD_LOG_EVERY = 1000
 
 
@@ -271,8 +268,6 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
     config = entity.OffloadConfig()
     config.device_id = device_id
     config.reserve_size = slot
-    # Every rank physically backs its own slot: together the node holds a
-    # full replica of all engram tables.
     config.alloc_size = slot
     config.world_size = local_world
     config.rank_id = rank
@@ -299,8 +294,7 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
             "config (check SGLANG_ENGRAM_OFFLOAD_STORE_URL)"
         )
 
-    # One whole-slot malloc; the chunks are carved at the fixed offsets above
-    # so a peer chunk is one registered slot stride away.
+    # One whole-slot malloc; the chunks are carved at the fixed offsets above.
     slot_base = entity.malloc(slot, 0)
     if slot_base == 0:
         raise RuntimeError(
@@ -387,9 +381,8 @@ class NpuEngramOffloadBackend:
         self._n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self._manager = get_engram_offload_manager(layout)
         self._table = self._manager.table(layer_hash_index)
-        # The chunk index is the node-local pool rank — every scheduler on the
-        # node, dp replicas included — not the global tp_rank; each node of a
-        # multi-node run holds its own replica's chunks.
+        # The chunk index is the node-local pool rank (dp replicas included),
+        # not the global tp_rank.
         self.rows = self._table.rows
         self.row_start = self._manager.rank * self.rows
         self._finalized = False
@@ -478,11 +471,8 @@ class NpuEngramOffloadBackend:
             self._table.block_offset,
         )
         # Size the fixed buffers ONCE for the largest batch any phase can
-        # produce. Graphs captured at any bs bake these addresses into their
-        # launches; a later realloc for a bigger eager prefill would leave
-        # every smaller captured graph with dangling pointers (the caching
-        # allocator recycles the old block), so growth is forbidden after
-        # this point.
+        # produce: captured graphs bake these addresses into their launches,
+        # so a later realloc would leave smaller graphs with dangling pointers.
         try:
             chunked_prefill = get_schedule().chunked_prefill_size or 0
             decode_bs = get_exec().graph.cuda_graph_config.decode.max_bs or 0
@@ -541,19 +531,14 @@ class NpuEngramOffloadBackend:
         return _OffloadForwardBuffers(count, self._table.entry_bytes, device)
 
     def gather(self, indices: torch.Tensor) -> torch.Tensor:
-        """indices [T, n_hash_cols] -> bf16 [T, n_hash_cols, head_dim].
-
-        entry_gather executes any uint32 row count (no batch cap); the
-        id/staging buffers are pre-sized once (finish_load) and frozen, so
-        graph-captured addresses stay valid across every batch size."""
+        """indices [T, n_hash_cols] -> bf16 [T, n_hash_cols, head_dim]."""
         assert self._finalized, "engram offload rows are not flushed yet"
         num_tokens, num_cols = indices.shape
         count = indices.numel()
         if count == 0:
             # Empty batch (e.g. a DP-attention idle dummy forward): return
             # without touching the buffers — sizing on first use at zero would
-            # freeze this layer onto a zero-capacity buffer forever. The row
-            # width is spelled out (not -1) so the reshape stays unambiguous.
+            # freeze this layer onto a zero-capacity buffer forever.
             return torch.empty(
                 num_tokens,
                 num_cols,
@@ -562,11 +547,9 @@ class NpuEngramOffloadBackend:
                 device=indices.device,
             )
         buffers = self._ensure_buffers(count, indices.device)
-        # The per-layer slice of hash_ids is strided ([T, L, H] cut on dim 1),
-        # so it always lands in the fixed ids buffer first — the kernel reads
-        # ids as a flat array. copy_ needs matching shapes (it broadcasts, it
-        # does not reinterpret), hence viewing the flat prefix as [T, H]; the
-        # strided source is still handled in one d2d pass.
+        # hash_ids' per-layer slice is strided ([T, L, H] cut on dim 1); copy_
+        # into the flat ids buffer needs matching shapes, hence the [T, H]
+        # view — the strided source still copies in one d2d pass.
         encoded = self._manager.encode_ids(indices, self._table)
         buffers.ids[:count].view(indices.shape).copy_(encoded)
         buffers.count.fill_(count)
@@ -590,11 +573,10 @@ class NpuEngramOffloadBackend:
         if ret != 0:
             raise RuntimeError(f"[engram_offload] entry_gather failed with code {ret}")
         staged = buffers.staging[: count * self._table.entry_bytes]
-        # Dequantize the staged fp8 rows with the same math as the device
-        # path (_owned_rows byte-view branch): each staged entry holds exactly
-        # one unpadded fp8 row, and the scale table is device-resident in
-        # full. e8m0 converts through the shared bit-exact helper — arch35
-        # implements neither an fp8 index nor an e8m0 cast.
+        # Dequantize with the device path's math — the shared _e8m0_to_float
+        # keeps the offload lookup bit-identical (arch35 has no fp8 index or
+        # e8m0 cast op). Each staged entry is exactly one unpadded fp8 row;
+        # the scale table is device-resident in full.
         rows = (
             staged.view(torch.float8_e4m3fn)
             .reshape(num_tokens, num_cols, self._table.head_dim)

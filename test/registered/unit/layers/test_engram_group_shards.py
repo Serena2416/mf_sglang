@@ -66,9 +66,7 @@ class TestEngramPlacementNPU(CustomTestCase):
                 "group_shards",
             ),
         ):
-            with self.subTest(raw=raw), self.assertRaisesRegex(
-                ValueError, pattern
-            ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, pattern):
                 EngramConfig.from_dict(raw)
 
 
