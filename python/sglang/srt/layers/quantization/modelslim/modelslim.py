@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Uni
 
 import torch
 
+from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
 )
@@ -175,9 +176,7 @@ class ModelSlimConfig(QuantizationConfig):
         super().__init__()
         self.requested_kv_cache_dtype = "auto"
         quant_config = dict(quant_config or {})
-        keys = [k for k in quant_config if isinstance(k, str)]
-        is_dsv4 = any(k.startswith("hc_head_") for k in keys)
-        if is_dsv4:
+        if is_deepseek_v4(quant_config.pop("hf_config", None)):
             from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
             remap = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format
