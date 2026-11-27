@@ -104,8 +104,13 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
                 f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
                 f"columns to divide over --tp-size {cfg.tp_size}."
             )
-    # One mapping per TP group, which its ranks open through /proc.
-    if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
+    # CUDA host tables open one mapping through /proc within a TP group.
+    # NPU pools instead derive node-local members from the distributed TP ranks.
+    if (
+        config.replication == EngramReplication.PER_NODE
+        and cfg.nnodes > 1
+        and not is_npu()
+    ):
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )

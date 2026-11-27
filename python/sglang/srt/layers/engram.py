@@ -123,19 +123,12 @@ def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
 
 
 def _npu_offload_supported() -> bool:
-    """Whether this NPU takes the acc_offload engram backend.
+    """Whether MemFabric supports SHARED MTE on this NPU (A3 or A5)."""
+    from sglang.srt.hardware_backend.npu.utils import is_ascend_910c, is_npu_arch35
 
-    NPU arch35 (A5) has the host pool; pre-arch35 has none, so a cpu
-    placement degrades to device-resident tables with a warning instead of
-    failing at weight-load time.
-    """
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-    if is_npu_arch35():
+    if is_npu_arch35() or is_ascend_910c():
         return True
-    logger.warning(
-        "engram host offload needs arch35 (A5); keeping device-resident tables"
-    )
+    logger.warning("engram host offload needs A3 or A5; keeping device-resident tables")
     return False
 
 
@@ -1364,9 +1357,11 @@ class EngramEmbedding(nn.Module):
         # stages (enable_scheduler_staging asserts a host_table).
         self.staged_by_scheduler = False
         config = resolve_engram_config(len(column_bounds) - 1)
-        # Validated before any routing so a host placement (the NPU offload
-        # route included: the hook rewrites 'npu' to CPU) is rejected, not
-        # silently routed.
+        npu_offload = (
+            config.placement == EngramPlacement.CPU
+            and is_npu()
+            and _npu_offload_supported()
+        )
         int8_storage = storage is not None
         if int8_storage:
             if mxfp4:
@@ -1385,16 +1380,19 @@ class EngramEmbedding(nn.Module):
             }
             if any(storage.get(k) != v for k, v in expected.items()):
                 raise ValueError(f"Unsupported Engram embedding storage: {storage}")
+            if npu_offload:
+                from sglang.srt.hardware_backend.npu.utils import is_ascend_910c
+
             if (
                 config.placement == EngramPlacement.CPU
-                or config.lookup == EngramLookup.PEER_READ
-            ):
+                and not (npu_offload and is_ascend_910c())
+            ) or config.lookup == EngramLookup.PEER_READ:
                 raise ValueError("INT8 Engram requires device-local table shards")
         if config.placement == EngramPlacement.CPU and is_npu():
-            if _npu_offload_supported():
-                self._init_offload_backend(config, layout, dim, layer_id)
+            if npu_offload:
+                self._init_offload_backend(config, layout, dim, layer_id, storage)
                 return
-            # pre-arch35: no host pool; fall through to device-resident tables
+            config = dataclasses.replace(config, placement=EngramPlacement.GPU)
         tp_rank = get_parallel().tp_rank
         self.row_start, row_end = shard_range(
             num_embeddings, column_bounds, tp_rank, self.tp_size
@@ -1458,8 +1456,9 @@ class EngramEmbedding(nn.Module):
         layout: Optional[EngramLayout],
         dim: int,
         layer_id: int,
+        storage: dict | None = None,
     ) -> None:
-        """NPU arch35: rows live in the node's acc_offload GVA pool; the
+        """NPU A3/A5: rows live in the acc_offload GVA pool; the
         backend owns the parameter surface (meta weight + staging loader) and
         the graph-safe lookup."""
         assert layout is not None, (
@@ -1475,7 +1474,7 @@ class EngramEmbedding(nn.Module):
             NpuEngramOffloadBackend,
         )
 
-        self._offload_backend = NpuEngramOffloadBackend(layout, dim, layer_id)
+        self._offload_backend = NpuEngramOffloadBackend(layout, dim, layer_id, storage)
         self._offload_backend.install_params(self)
 
     def _init_host_table(
