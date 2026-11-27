@@ -461,7 +461,7 @@ class TestFailFastSurface(CustomTestCase):
             num_embeddings=(10,),
             primes=(((13, 17),),),
             n_heads=1,
-            head_dim=engram_offload._MAX_ENTRY_BYTES + 1,
+            head_dim=120 * 1024 + 1,
         )
         with _OffloadHarness(
             node_local_env={
@@ -562,7 +562,14 @@ class TestBackendLifecycle(CustomTestCase):
 
 
 class TestGatherEquivalence(CustomTestCase):
+    def test_a3_gather_matches_device_path_bitwise(self):
+        with patch.object(engram_offload, "is_npu_a3", return_value=True):
+            self._check_gather_equivalence()
+
     def test_gather_matches_device_path_bitwise(self):
+        self._check_gather_equivalence()
+
+    def _check_gather_equivalence(self):
         with _OffloadHarness(node_local_env=_WORLD_ENV):
             holder = nn.Module()
             backend = _make_backend(holder)
@@ -679,13 +686,15 @@ def _patch_engram_config(config: EngramConfig):
 
 
 @contextlib.contextmanager
-def _routing_patches(config, is_arch35: bool):
+def _routing_patches(config, is_arch35: bool, *, a3=False):
     """NPU seams for EngramEmbedding routing: the pinned engram config, the
     platform, the arch35 probe, and a two-rank TP group."""
     with contextlib.ExitStack() as stack:
         for cm in (
             _patch_engram_config(config),
             patch.object(engram_mod, "is_npu", return_value=True),
+            patch("sglang.srt.hardware_backend.npu.utils.is_npu_a3", return_value=a3),
+            patch.object(engram_offload, "is_npu_a3", return_value=a3),
             patch(
                 "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
                 return_value=is_arch35,
@@ -731,7 +740,22 @@ class TestPlacementRouting(CustomTestCase):
                 self.assertEqual(embed.weight.device.type, "meta")
                 self.assertEqual((embed.rows, embed.row_start), (250, 250))
 
-    def test_pre_arch35_degrades_to_device_tables(self):
+    def test_a3_routes_to_offload(self):
+        config = EngramConfig(
+            placement=EngramPlacement.CPU, replication=EngramReplication.PER_NODE
+        )
+        with _OffloadHarness(node_local_env=_WORLD_ENV):
+            with _routing_patches(config, is_arch35=False, a3=True):
+                embed = EngramEmbedding(
+                    _NUM_EMBEDDINGS,
+                    _HEAD_DIM,
+                    5,
+                    column_bounds=(0, _NUM_EMBEDDINGS),
+                    layout=_LAYOUT,
+                )
+                self.assertIsNotNone(embed._offload_backend)
+
+    def test_unsupported_npu_degrades_to_device_tables(self):
         config = EngramConfig(placement=EngramPlacement.CPU)
         with _OffloadHarness(node_local_env=_WORLD_ENV):
             with _routing_patches(config, is_arch35=False):

@@ -37,6 +37,16 @@ def is_npu_arch35() -> bool:
     return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
+@functools.lru_cache(maxsize=1)
+def is_npu_a3() -> bool:
+    if not is_npu():
+        return False
+
+    import acl
+
+    return "Ascend910_93" in acl.get_soc_name()
+
+
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
 # SoCs report higher values and share the same capability gates.
 ASCEND_950_SOC_VERSION = 260

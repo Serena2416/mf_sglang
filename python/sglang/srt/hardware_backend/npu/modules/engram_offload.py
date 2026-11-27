@@ -1,4 +1,4 @@
-"""Host offload of the DeepSeek-V4.1 engram hash tables via memfabric_hybrid acc_offload (NPU arch35).
+"""Host offload of the DeepSeek-V4.1 engram hash tables via memfabric_hybrid acc_offload (NPU A3/A5).
 
 SHARED mode maps the same GVA window into every rank of one node: world_size
 contiguous per-rank host slots, each physically backed by its own rank. The
@@ -40,6 +40,7 @@ from torch import nn
 
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_npu_a3
 
 # The dequant helper is shared with the device-resident path on purpose: the
 # offloaded lookup must stay bit-identical to it (and to the GPU gather
@@ -54,9 +55,6 @@ from sglang.srt.utils.device import is_device_stream_capturing
 logger = logging.getLogger(__name__)
 
 _GIB = 1 << 30
-# One row must fit one 120KB UB ping-pong slot inside the entry_gather AIV
-# kernel (OFFLOAD_ENTRY_GATHER_MAX_ENTRY_BYTES in acc_offload.h).
-_MAX_ENTRY_BYTES = 120 * 1024
 # The share pool holds at most 16 node-local ranks.
 _MAX_LOCAL_WORLD = 16
 # Heartbeat interval for the per-forward lookup logs (the first call is always
@@ -237,11 +235,13 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
     )
 
     entity = _make_offload_entity(offload)
-    # arch35 keeps fp8 rows (1 byte/element); the pool and entry_gather treat
+    # The host pool keeps fp8 rows (1 byte/element); the pool and entry_gather treat
     # entry_bytes as the row pitch and never interpret the row width.
     entry_bytes = layout.head_dim
-    assert 1 <= entry_bytes <= _MAX_ENTRY_BYTES, (
-        f"engram row {entry_bytes}B exceeds the {_MAX_ENTRY_BYTES}B entry_gather limit"
+    # Each entry must fit one ping-pong slot in the gather kernel.
+    max_entry_bytes = (88 if is_npu_a3() else 120) * 1024
+    assert 1 <= entry_bytes <= max_entry_bytes, (
+        f"engram row {entry_bytes}B exceeds the {max_entry_bytes}B entry_gather limit"
     )
     # Per-layer chunk layout in layer_hash_index order, packed back to back
     # from the slot start (row pitch = head_dim, no padding); every rank runs
@@ -374,7 +374,7 @@ class _OffloadForwardBuffers:
 
 
 class NpuEngramOffloadBackend:
-    """EngramTableBackend for NPU arch35: full-replica rows in the node's
+    """EngramTableBackend for NPU A3/A5: full-replica rows in the node's
     acc_offload SHARED pool. One instance per EngramEmbedding; all instances
     share the process-wide pool via get_engram_offload_manager."""
 
@@ -424,12 +424,21 @@ class NpuEngramOffloadBackend:
             torch.empty(
                 self._table.num_embeddings,
                 self._dim // FP8_BLOCK_SIZE,
-                dtype=torch.float8_e8m0fnu,
+                dtype=torch.uint8,
             ),
             requires_grad=False,
         )
         embed.scale.weight_loader = self._load_scale_rows
         self._scale = embed.scale
+        # A3 cannot cast FP8 on device. Decode its 256 bit patterns once on CPU.
+        self._fp8_values = None
+        if is_npu_a3():
+            self._fp8_values = (
+                torch.arange(256, dtype=torch.uint8, device="cpu")
+                .view(torch.float8_e4m3fn)
+                .float()
+                .to(embed.scale.device)
+            )
         logger.info(
             "[engram_offload] rank %d: layer %d OFFLOAD mode engaged "
             "(E=%d chunk_rows=%d entry=%dB block_off=%d; "
@@ -453,7 +462,7 @@ class NpuEngramOffloadBackend:
             self._staging_weight[rows.shape[0] :].view(torch.uint8).zero_()
 
     def _load_scale_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
+        param.data.copy_(loaded_weight.view(torch.uint8))
 
     def finish_load(self, label: str) -> None:
         """Flush the pinned staging chunk into the GVA pool and pre-size the
@@ -595,11 +604,10 @@ class NpuEngramOffloadBackend:
         # one unpadded fp8 row, and the scale table is device-resident in
         # full. e8m0 converts through the shared bit-exact helper — arch35
         # implements neither an fp8 index nor an e8m0 cast.
-        rows = (
-            staged.view(torch.float8_e4m3fn)
-            .reshape(num_tokens, num_cols, self._table.head_dim)
-            .float()
-            .unflatten(-1, (-1, FP8_BLOCK_SIZE))
-        )
-        scales = _e8m0_to_float(self._scale.view(torch.uint8)[indices]).unsqueeze(-1)
+        if self._fp8_values is None:
+            rows = staged.view(torch.float8_e4m3fn).float()
+        else:
+            rows = self._fp8_values[staged.long()]
+        rows = rows.reshape(num_tokens, num_cols, -1, FP8_BLOCK_SIZE)
+        scales = _e8m0_to_float(self._scale[indices]).unsqueeze(-1)
         return (rows * scales).flatten(-2).to(torch.bfloat16)

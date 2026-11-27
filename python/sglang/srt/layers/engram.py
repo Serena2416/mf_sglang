@@ -123,18 +123,12 @@ def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
 
 
 def _npu_offload_supported() -> bool:
-    """Whether this NPU takes the acc_offload engram backend.
+    from sglang.srt.hardware_backend.npu.utils import is_npu_a3, is_npu_arch35
 
-    NPU arch35 (A5) has the host pool; pre-arch35 has none, so a cpu
-    placement degrades to device-resident tables with a warning instead of
-    failing at weight-load time.
-    """
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-    if is_npu_arch35():
+    if is_npu_arch35() or is_npu_a3():
         return True
     logger.warning(
-        "engram host offload needs arch35 (A5); keeping device-resident tables"
+        "engram host offload requires A3 or A5; keeping device-resident tables"
     )
     return False
 
@@ -1337,8 +1331,8 @@ class EngramEmbedding(nn.Module):
     columns where they divide evenly (`shard_range`); --engram-config can read
     the peers' shards in place or keep the rows in host memory instead, as one
     shard per rank or one copy per node on CUDA/HIP (see _HostTable), or
-    behind the node-shared acc_offload pool (EngramTableBackend) on NPU
-    arch35. Loading is sharded in every layout: a rank writes only its own row
+    behind the node-shared acc_offload pool (EngramTableBackend) on Ascend
+    A3/A5. Loading is sharded in every layout: a rank writes only its own row
     range.
     """
 
@@ -1368,7 +1362,6 @@ class EngramEmbedding(nn.Module):
             if _npu_offload_supported():
                 self._init_offload_backend(config, layout, dim, layer_id)
                 return
-            # pre-arch35: no host pool; fall through to device-resident tables
         tp_rank = get_parallel().tp_rank
         self.row_start, row_end = shard_range(
             num_embeddings, column_bounds, tp_rank, self.tp_size
@@ -1426,7 +1419,7 @@ class EngramEmbedding(nn.Module):
         dim: int,
         layer_id: int,
     ) -> None:
-        """NPU arch35: rows live in the node's acc_offload GVA pool; the
+        """NPU A3/A5: rows live in the node's acc_offload GVA pool; the
         backend owns the parameter surface (meta weight + staging loader) and
         the graph-safe lookup."""
         assert layout is not None, (
