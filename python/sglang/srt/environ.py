@@ -2191,6 +2191,11 @@ class Envs:
     # (OffloadConfig.store_url); empty lets memfabric derive one. Every rank of
     # a node must agree — set it when PD's ASCEND_MF_STORE_URL shares the node.
     SGLANG_ENGRAM_OFFLOAD_STORE_URL = EnvStr("")
+    # Optional pool spanning serving instances. Ranks are machine-contiguous;
+    # an empty owner list lets every rank contribute physical DRAM.
+    SGLANG_ENGRAM_OFFLOAD_WORLD_SIZE = EnvInt(0)
+    SGLANG_ENGRAM_OFFLOAD_RANK_OFFSET = EnvInt(0)
+    SGLANG_ENGRAM_OFFLOAD_OWNER_RANKS = EnvStr("")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

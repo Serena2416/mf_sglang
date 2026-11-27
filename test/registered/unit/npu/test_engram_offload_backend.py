@@ -18,7 +18,7 @@ import sys
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -103,9 +103,9 @@ class _FakeOffloadEntity:
     def initialize(self, config):
         assert self._config is None, "fake entity initialized twice"
         self._config = config
-        total = config.alloc_size * config.world_size
+        total = config.reserve_size * config.world_size
         self._buf = (ctypes.c_char * total)()
-        self._slot = config.alloc_size
+        self._slot = config.reserve_size
         return 0
 
     def malloc(self, size, flags=0):
@@ -212,6 +212,9 @@ class _OffloadHarness:
             patch.object(engram_offload, "_current_device_id", return_value=0)
         )
         stack.enter_context(patch.object(engram_offload, "_MANAGER", None))
+        stack.enter_context(
+            patch.object(engram_offload, "is_ascend_910c", return_value=False)
+        )
         if self.node_local_env is None:
             stack.enter_context(_without_node_local_env())
         else:
@@ -236,12 +239,12 @@ def _write_all_chunks(entity, manager, table, src_u8: np.ndarray) -> None:
     """Simulate every node-local rank having flushed its chunk (the fake pool
     is one process buffer, so the test writes the peer slots directly)."""
     pool = np.frombuffer(entity._buf, dtype=np.uint8)
-    for chunk_rank in range(manager.local_world):
+    for chunk_rank, pool_rank in enumerate(manager.owner_ranks):
         lo = chunk_rank * table.rows
         hi = min(lo + table.rows, table.num_embeddings)
         if lo >= hi:
             break
-        start = chunk_rank * manager.slot + table.block_offset
+        start = pool_rank * manager.slot + table.block_offset
         n = (hi - lo) * table.entry_bytes
         pool[start : start + n] = src_u8.reshape(-1)[
             lo * table.entry_bytes : hi * table.entry_bytes
@@ -255,7 +258,11 @@ def _pool_rows(entity, manager, table, ids: torch.Tensor) -> torch.Tensor:
     out = np.empty((ids.numel(), table.entry_bytes), dtype=np.uint8)
     for j, row in enumerate(ids.reshape(-1).tolist()):
         slot_i, in_slot = divmod(row, table.rows)
-        start = slot_i * manager.slot + table.block_offset + in_slot * table.entry_bytes
+        start = (
+            manager.owner_ranks[slot_i] * manager.slot
+            + table.block_offset
+            + in_slot * table.entry_bytes
+        )
         out[j] = pool[start : start + table.entry_bytes]
     return torch.from_numpy(out).reshape(*ids.shape, table.entry_bytes)
 
@@ -295,7 +302,6 @@ class TestPoolOpenAndAddressing(CustomTestCase):
             self.assertEqual((t1.rows, t1.block_offset), (176, 250 * _HEAD_DIM))
             self.assertEqual(manager.slot, _SLOT_GIB)
             self.assertEqual(t0.entry_bytes, _HEAD_DIM)
-            self.assertEqual(manager._entity._tables, [(_HEAD_DIM, 426)])
 
             # every row of both tables, gathered back through the fake kernel,
             # matches the source bytes: covers chunk boundaries (249/250,
@@ -341,6 +347,25 @@ class TestPoolOpenAndAddressing(CustomTestCase):
             manager.uninitialize()
             self.assertTrue(h.module.offload.uninitialized)
 
+    def test_single_node_keeps_legacy_config_compatible(self):
+        defaults = vars(_FakeOffloadConfig())
+        legacy_type = type("LegacyConfig", (), {"__slots__": tuple(defaults)})
+
+        def make_config():
+            config = legacy_type()
+            for key, value in defaults.items():
+                setattr(config, key, value)
+            return config
+
+        with (
+            _OffloadHarness(multi_instance=False, node_local_env=_WORLD_ENV) as h,
+            patch.object(engram_offload, "_GIB", 1 << 16),
+        ):
+            h.module.offload.OffloadConfig = make_config
+            manager = _open_manager()
+            self.assertEqual(manager._entity._config.world_size, 4)
+            self.assertFalse(hasattr(manager._entity._config, "local_world_size"))
+
     def test_store_url_reaches_the_pool_config(self):
         with (
             _OffloadHarness(node_local_env=_WORLD_ENV),
@@ -362,6 +387,66 @@ class TestPoolOpenAndAddressing(CustomTestCase):
 
 
 class TestPoolCoords(CustomTestCase):
+    def test_cross_instance_consumer_reads_noncontiguous_owners(self):
+        store = Mock()
+        store.get.side_effect = lambda key: store.set.call_args_list[0].args[1]
+        with (
+            _OffloadHarness(node_local_env=_WORLD_ENV),
+            envs.SGLANG_ENGRAM_OFFLOAD_WORLD_SIZE.override(8),
+            envs.SGLANG_ENGRAM_OFFLOAD_OWNER_RANKS.override("4,6"),
+            envs.SGLANG_ENGRAM_OFFLOAD_STORE_URL.override("tcp://127.0.0.1:18500"),
+            patch.object(engram_offload, "_GIB", 1 << 16),
+            patch.object(torch.distributed, "TCPStore", return_value=store),
+        ):
+            manager = _open_manager()
+            self.assertIsNone(manager.owner_index)
+            self.assertEqual(manager._entity._config.alloc_size, 0)
+            self.assertEqual(manager._entity._config.local_world_size, 4)
+            for index, size in enumerate(_LAYOUT.num_embeddings):
+                table = manager.table(index)
+                src = (np.arange(size * _HEAD_DIM) % 251).astype(np.uint8)
+                _write_all_chunks(manager._entity, manager, table, src)
+                ids = torch.tensor([0, table.rows - 1, table.rows, size - 1])
+                dst = torch.empty(ids.numel() * _HEAD_DIM, dtype=torch.uint8)
+                self.assertEqual(
+                    manager.entry_gather(
+                        dst,
+                        manager.encode_ids(ids, table),
+                        torch.tensor(ids.numel(), dtype=torch.int32),
+                        torch.device("cpu"),
+                    ),
+                    0,
+                )
+                np.testing.assert_array_equal(
+                    dst.numpy().reshape(-1, _HEAD_DIM),
+                    src.reshape(size, _HEAD_DIM)[ids.numpy()],
+                )
+            manager.finish_load(1)
+            store.wait.assert_called_with(["loaded/1/4", "loaded/1/6"])
+
+    def test_owner_slice_uses_owner_index_instead_of_pool_rank(self):
+        store = Mock()
+        store.get.side_effect = lambda key: store.set.call_args_list[0].args[1]
+        with (
+            _OffloadHarness(
+                node_local_env={
+                    "SGLANG_NODE_LOCAL_WORLD": "4",
+                    "SGLANG_NODE_LOCAL_RANK": "2",
+                }
+            ),
+            envs.SGLANG_ENGRAM_OFFLOAD_WORLD_SIZE.override(8),
+            envs.SGLANG_ENGRAM_OFFLOAD_RANK_OFFSET.override(4),
+            envs.SGLANG_ENGRAM_OFFLOAD_OWNER_RANKS.override("4,6"),
+            envs.SGLANG_ENGRAM_OFFLOAD_STORE_URL.override("tcp://127.0.0.1:18500"),
+            patch.object(engram_offload, "_GIB", 1 << 16),
+            patch.object(torch.distributed, "TCPStore", return_value=store),
+        ):
+            backend = _make_backend(nn.Module())
+            self.assertEqual(
+                (backend._manager.rank, backend._manager.owner_index), (6, 1)
+            )
+            self.assertEqual((backend.rows, backend.row_start), (500, 500))
+
     def test_coord_fallback_order(self):
         cases = [
             # (env, expected): SGLANG_ node-local wins over torchrun's, and a
@@ -385,11 +470,17 @@ class TestPoolCoords(CustomTestCase):
                         engram_offload._node_local_pool_coords(4, 0), expected
                     )
 
-    def test_multi_node_without_coords_fails_fast(self):
+    def test_multi_node_tp_derives_local_coordinates(self):
         with _OffloadHarness(parallel=_default_parallel(nnodes=2)):
-            with self.assertRaises(RuntimeError) as cm:
+            for rank in range(4):
+                self.assertEqual(
+                    engram_offload._node_local_pool_coords(4, rank), (2, rank % 2)
+                )
+
+    def test_multi_node_pipeline_requires_explicit_coordinates(self):
+        with _OffloadHarness(parallel=_default_parallel(nnodes=2, pp_size=2)):
+            with self.assertRaisesRegex(RuntimeError, "node-local"):
                 _open_manager()
-            self.assertIn("node-local", str(cm.exception))
 
     def test_same_node_pp_fails_fast(self):
         with _OffloadHarness(parallel=_default_parallel(pp_size=2)):
@@ -480,6 +571,30 @@ class TestFailFastSurface(CustomTestCase):
 
 
 class TestBackendLifecycle(CustomTestCase):
+    def test_a3_uses_mapped_lookup_without_staging_buffers(self):
+        with _OffloadHarness(node_local_env=_WORLD_ENV):
+            with patch.object(engram_offload, "is_ascend_910c", return_value=True):
+                manager = _open_manager()
+                manager._entity.get_mapped_pool = lambda: (0x280000000000, manager.slot)
+                backend = _make_backend(nn.Module())
+            backend.finish_load("a3")
+            self.assertIsNone(backend._buffers)
+            self.assertEqual(
+                backend._table.entry_bytes, _HEAD_DIM + _HEAD_DIM // FP8_BLOCK_SIZE
+            )
+            self.assertEqual(backend._scale.device.type, "meta")
+            expected = [0x280000000000 + rank * manager.slot for rank in range(4)]
+            self.assertEqual(backend._mapped_bases.tolist(), expected)
+            ids = torch.zeros((2, _N_HASH_COLS), dtype=torch.int64)
+            result = torch.empty((2, _N_HASH_COLS, _HEAD_DIM), dtype=torch.bfloat16)
+            with patch(
+                "sglang.kernels.ops.embeddings.engram_mapped_gather.mapped_engram_gather",
+                return_value=result,
+            ) as gather:
+                self.assertIs(backend.gather(ids), result)
+            gather.assert_called_once()
+            self.assertIsNone(backend._buffers)
+
     def test_install_params_surface(self):
         with _OffloadHarness(node_local_env=_WORLD_ENV):
             holder = nn.Module()
@@ -562,6 +677,37 @@ class TestBackendLifecycle(CustomTestCase):
 
 
 class TestGatherEquivalence(CustomTestCase):
+    def test_int8_codes_use_modelslim_format_without_fp8_conversion(self):
+        with _OffloadHarness(node_local_env=_WORLD_ENV):
+            storage = {"format": "int8_sym"}
+            backend = engram_offload.NpuEngramOffloadBackend(
+                _LAYOUT, _HEAD_DIM, 5, storage
+            )
+            holder = nn.Module()
+            backend.install_params(holder)
+            weight = torch.randint(
+                -128, 128, (_NUM_EMBEDDINGS, _HEAD_DIM), dtype=torch.int8
+            )
+            scale = torch.full(
+                (_NUM_EMBEDDINGS, _HEAD_DIM // FP8_BLOCK_SIZE), 127, dtype=torch.uint8
+            ).view(torch.float8_e8m0fnu)
+            _write_all_chunks(
+                backend._manager._entity,
+                backend._manager,
+                backend._table,
+                weight.view(torch.uint8).numpy(),
+            )
+            backend._load_weight_rows(holder.weight, weight)
+            backend._load_scale_rows(holder.scale, scale)
+            backend.finish_load("int8")
+            ids = torch.tensor(
+                [[0, 249, 250, 999], [500, 501, 749, 750]], dtype=torch.int64
+            )
+            self.assertEqual(holder.weight.dtype, torch.int8)
+            torch.testing.assert_close(
+                backend.gather(ids), weight[ids].to(torch.bfloat16), rtol=0, atol=0
+            )
+
     def test_gather_matches_device_path_bitwise(self):
         with _OffloadHarness(node_local_env=_WORLD_ENV):
             holder = nn.Module()
@@ -686,9 +832,19 @@ def _routing_patches(config, is_arch35: bool):
         for cm in (
             _patch_engram_config(config),
             patch.object(engram_mod, "is_npu", return_value=True),
+            patch.object(
+                engram_mod.torch,
+                "npu",
+                SimpleNamespace(get_device_name=lambda: "Ascend910B"),
+                create=True,
+            ),
             patch(
                 "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
                 return_value=is_arch35,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_ascend_910c",
+                return_value=False,
             ),
             patch.object(
                 engram_mod,
@@ -701,6 +857,101 @@ def _routing_patches(config, is_arch35: bool):
 
 
 class TestPlacementRouting(CustomTestCase):
+    def test_a3_int8_host_placement_uses_mapped_pool(self):
+        config = EngramConfig(
+            placement=EngramPlacement.CPU, replication=EngramReplication.PER_NODE
+        )
+        storage = {
+            "format": "int8_sym",
+            "weight_dtype": "I8",
+            "layout": "row_major",
+            "group_size": FP8_BLOCK_SIZE,
+            "axis": 1,
+            "scale_suffix": "scale",
+            "scale_dtype": "F8_E8M0",
+            "weight_shape": [_NUM_EMBEDDINGS, _HEAD_DIM],
+            "scale_shape": [_NUM_EMBEDDINGS, _HEAD_DIM // FP8_BLOCK_SIZE],
+        }
+        with (
+            _OffloadHarness(node_local_env=_WORLD_ENV),
+            _routing_patches(config, is_arch35=False),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_ascend_910c",
+                return_value=True,
+            ),
+            patch.object(engram_offload, "is_ascend_910c", return_value=True),
+            patch.object(
+                _FakeOffloadEntity,
+                "get_mapped_pool",
+                lambda entity: (ctypes.addressof(entity._buf), entity._slot),
+                create=True,
+            ),
+        ):
+            embed = EngramEmbedding(
+                _NUM_EMBEDDINGS,
+                _HEAD_DIM,
+                5,
+                column_bounds=(0, _NUM_EMBEDDINGS),
+                layout=_LAYOUT,
+                storage=storage,
+            )
+            self.assertEqual(embed.weight.dtype, torch.int8)
+            self.assertEqual(embed.weight.device.type, "meta")
+            self.assertEqual(embed.scale.device.type, "meta")
+            self.assertIsNotNone(embed._offload_backend._mapped_bases)
+        # Keep the existing A5 INT8 host-placement rejection; its FP8 staged
+        # entry_gather path is covered separately by the equivalence tests.
+        with (
+            _OffloadHarness(node_local_env=_WORLD_ENV),
+            _routing_patches(config, is_arch35=True),
+            self.assertRaisesRegex(ValueError, "device-local table shards"),
+        ):
+            EngramEmbedding(
+                _NUM_EMBEDDINGS,
+                _HEAD_DIM,
+                5,
+                column_bounds=(0, _NUM_EMBEDDINGS),
+                layout=_LAYOUT,
+                storage=storage,
+            )
+
+    def test_multinode_npu_replication_config_is_accepted(self):
+        from sglang.srt.arg_groups import deepseek_v4_hook as hook
+
+        cfg = SimpleNamespace(
+            engram_config={"placement": "cpu", "replication": "per_node"},
+            nnodes=2,
+        )
+        with (
+            patch.object(hook, "resolving_view", return_value=cfg),
+            patch.object(
+                hook,
+                "model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="deepseek_v41")
+                ),
+            ),
+            patch.object(hook, "is_npu", return_value=True),
+            patch.object(hook, "declare_resolution") as declared,
+        ):
+            hook._resolve_engram_config(object())
+        self.assertEqual(
+            declared.call_args.kwargs["engram_config"].replication, "per_node"
+        )
+        with (
+            patch.object(hook, "resolving_view", return_value=cfg),
+            patch.object(
+                hook,
+                "model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="deepseek_v41")
+                ),
+            ),
+            patch.object(hook, "is_npu", return_value=False),
+            self.assertRaisesRegex(ValueError, "TP group on one node"),
+        ):
+            hook._resolve_engram_config(object())
+
     def test_gpu_placement_keeps_device_tables(self):
         with _OffloadHarness(node_local_env=_WORLD_ENV):
             with _routing_patches(EngramConfig(), is_arch35=True):

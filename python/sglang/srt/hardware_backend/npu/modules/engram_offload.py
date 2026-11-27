@@ -1,44 +1,35 @@
-"""Host offload of the DeepSeek-V4.1 engram hash tables via memfabric_hybrid acc_offload (NPU arch35).
+"""NPU Engram offload through MemFabric SHARED DRAM pools.
 
-SHARED mode maps the same GVA window into every rank of one node: world_size
-contiguous per-rank host slots, each physically backed by its own rank. The
-engram fp8 weight tables are row-sharded across those node-local slots —
-numbered over every scheduler process on the node, dp replicas included,
-which load identical bytes so the node keeps a single replica; never across
-machines, so a multi-node run keeps one replica per node — and forward
-gathers the selected rows with the acc_offload entry_gather AIV kernel over a
-slot-segmented layout: each rank's slot holds the row chunks back to back
-from the slot start (row pitch = engram head dim, no padding) and whatever
-the slot cannot hold stays empty at its tail, which the kernel addressing
-strides over. One uniform grid is registered for the whole slot after init.
-Before gather, layer row ids are encoded with the owner slot and layer offset;
-the MemFabric call takes only dst, encoded ids, count and device.
-The e8m0 scale tables are 128x smaller and stay resident on the device.
+By default each node holds a complete replica, row-sharded over its schedulers.
+A3 pools can also span P/D instances: configured owners contribute DRAM, while
+other ranks only map the pool. Each owner packs all same-width table chunks
+into one slot. Registration uses a single uniform grid, without table handles.
 
-The shared framework (sglang.srt.layers.engram.EngramEmbedding) reaches this
-backend through the EngramTableBackend protocol with a function-level import.
-
-The pool is reserved and the layouts registered once per process, identically
-on every rank (model build order is rank-uniform), which is what lets the NPU
-graph capture the lookup. Rows are flushed in finish_load, which runs at the
-end of load_weights — before the scheduler serves requests and before any
-graph capture — so no gather can race a peer's flush.
+A5 stages encoded rows through entry_gather and retains scales in HBM. A3 packs
+each row's codes and E8M0 scales together in DRAM, then reads and dequantizes
+INT8/FP8 into BF16 in one device kernel.
+Both paths retain the pool and device metadata throughout graph replay.
+Cross-instance loading is synchronized separately from the P/D process groups
+before either side can capture or execute a lookup.
 """
 
 from __future__ import annotations
 
 import atexit
 import ctypes
+import datetime
 import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 import torch
 from torch import nn
 
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_ascend_910c
 
 # The dequant helper is shared with the device-resident path on purpose: the
 # offloaded lookup must stay bit-identical to it (and to the GPU gather kernel).
@@ -87,8 +78,8 @@ class EngramOffloadTable:
 
     Row `i` of the layer table lives at
     `pool_base + block_offset + (i // rows) * slot + (i % rows) * entry_bytes`
-    — chunk rank is the node-local rank, the slot stride hops over each
-    slot's tail gap. Forward folds the layer offset into the uniform-grid ids.
+    where i // rows selects owner_ranks[i // rows]. The slot stride skips
+    each owner's unused tail; block_offset selects the layer within a slot.
     """
 
     layer_hash_index: int
@@ -115,6 +106,8 @@ class EngramOffloadManager:
         rank: int,
         slot: int,
         tables: list[EngramOffloadTable],
+        owner_ranks: list[int],
+        load_store=None,
     ):
         self._entity = entity
         self._device_id = device_id
@@ -122,14 +115,37 @@ class EngramOffloadManager:
         self.rank = rank
         self.slot = slot
         self._tables = tables
+        self.owner_ranks = owner_ranks
+        self.owner_index = owner_ranks.index(rank) if rank in owner_ranks else None
         self.rows_per_slot = sum(table.rows for table in tables)
+        self._owners: Optional[torch.Tensor] = None
+        self._load_store = load_store
+
+    def prepare_owners(self, device: torch.device) -> None:
+        if self._owners is None and self.owner_ranks != list(
+            range(len(self.owner_ranks))
+        ):
+            self._owners = torch.tensor(
+                self.owner_ranks, dtype=torch.int64, device=device
+            )
 
     def encode_ids(self, ids: torch.Tensor, table: EngramOffloadTable) -> torch.Tensor:
+        self.prepare_owners(ids.device)
+        owner = ids // table.rows
+        if self._owners is not None:
+            owner = self._owners[owner]
         return (
-            (ids // table.rows) * self.rows_per_slot
+            owner * self.rows_per_slot
             + table.block_offset // table.entry_bytes
             + ids % table.rows
         )
+
+    def finish_load(self, layer_index: int) -> None:
+        if self._load_store is not None:
+            self._load_store.set(f"loaded/{layer_index}/{self.rank}", b"1")
+            self._load_store.wait(
+                [f"loaded/{layer_index}/{rank}" for rank in self.owner_ranks]
+            )
 
     def table(self, layer_hash_index: int) -> EngramOffloadTable:
         return self._tables[layer_hash_index]
@@ -154,9 +170,9 @@ def _node_local_pool_coords(tp_size: int, tp_rank: int) -> tuple[int, int]:
        dense node-local scheduler index, if one exists.
     2. LOCAL_WORLD_SIZE / LOCAL_RANK — torchrun-style launches carry the same
        fact.
-    3. Single-node runs fall back to the TP group, which then must fit one
-       node. Multi-node runs have no reliable node-local index here and fail
-       fast instead of silently double-sharding the pool.
+    3. Without pipeline parallelism, TP ranks are contiguous per node, so
+       derive the local scheduler index from the distributed TP layout.
+       Other multi-node layouts require an explicit local index.
     """
     for world_var, rank_var in (
         ("SGLANG_NODE_LOCAL_WORLD", "SGLANG_NODE_LOCAL_RANK"),
@@ -165,8 +181,12 @@ def _node_local_pool_coords(tp_size: int, tp_rank: int) -> tuple[int, int]:
         world, rank = os.environ.get(world_var), os.environ.get(rank_var)
         if world is not None and rank is not None:
             return int(world), int(rank)
-    if get_parallel().nnodes == 1:
+    parallel = get_parallel()
+    if parallel.nnodes == 1:
         return tp_size, tp_rank
+    if parallel.pp_size == 1 and tp_size % parallel.nnodes == 0:
+        local_world = tp_size // parallel.nnodes
+        return local_world, tp_rank % local_world
     raise RuntimeError(
         "engram offload on a multi-node run needs a node-local scheduler "
         "index: set SGLANG_NODE_LOCAL_WORLD / SGLANG_NODE_LOCAL_RANK, or "
@@ -233,22 +253,63 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
         f"got {local_world}"
     )
 
+    world = envs.SGLANG_ENGRAM_OFFLOAD_WORLD_SIZE.get() or local_world
+    rank_offset = envs.SGLANG_ENGRAM_OFFLOAD_RANK_OFFSET.get()
+    if not 0 <= rank < local_world:
+        raise ValueError("Engram node-local rank must be within local_world_size")
+    rank += rank_offset
+    if (
+        world < local_world
+        or world % local_world
+        or rank_offset % local_world
+        or not 0 <= rank < world
+    ):
+        raise ValueError(
+            "Engram pool ranks must be dense, machine-contiguous and within world_size"
+        )
+    owners = envs.SGLANG_ENGRAM_OFFLOAD_OWNER_RANKS.get()
+    owner_ranks = (
+        [int(value) for value in owners.split(",")] if owners else list(range(world))
+    )
+    if (
+        not owner_ranks
+        or len(set(owner_ranks)) != len(owner_ranks)
+        or any(r < 0 or r >= world for r in owner_ranks)
+    ):
+        raise ValueError(
+            "Engram owner ranks must be unique pool ranks within world_size"
+        )
+    owner_index = owner_ranks.index(rank) if rank in owner_ranks else None
+    store_url = envs.SGLANG_ENGRAM_OFFLOAD_STORE_URL.get()
+    address = urlsplit(store_url)
+    if world != local_world and (
+        address.scheme != "tcp"
+        or not address.hostname
+        or not address.port
+        or address.port >= 65535
+    ):
+        raise ValueError(
+            "A cross-instance Engram pool requires an explicit tcp://host:port store URL"
+        )
+
     entity = _make_offload_entity(offload)
-    # arch35 keeps fp8 rows (1 byte/element); the pool and entry_gather treat
+    # INT8/FP8 codes use one byte per element; the pool and entry_gather treat
     # entry_bytes as the row pitch and never interpret the row width.
     entry_bytes = layout.head_dim
+    if is_ascend_910c():
+        entry_bytes += layout.head_dim // FP8_BLOCK_SIZE
     assert 1 <= entry_bytes <= _MAX_ENTRY_BYTES, (
         f"engram row {entry_bytes}B exceeds the {_MAX_ENTRY_BYTES}B entry_gather limit"
     )
     # Per-layer chunk layout in layer_hash_index order, packed back to back
-    # from the slot start (row pitch = head_dim, no padding); every rank runs
+    # from the slot start (row pitch = entry_bytes); every rank runs
     # the same arithmetic, so block offsets inside each slot are identical.
     # Ceil: the last chunk's tail rows stay unused (hash ids stay below
     # num_embeddings, so the slack is never addressed).
     chunks = []
     offset = 0
     for num_embeddings in layout.num_embeddings:
-        rows = -(-num_embeddings // local_world)
+        rows = -(-num_embeddings // len(owner_ranks))
         chunks.append((offset, rows, num_embeddings))
         offset += rows * entry_bytes
     used = offset
@@ -260,7 +321,7 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
         used / (1 << 20),
         100.0 * used / slot,
         entry_bytes,
-        local_world,
+        world,
         rank,
     )
 
@@ -268,12 +329,14 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
     config = entity.OffloadConfig()
     config.device_id = device_id
     config.reserve_size = slot
-    config.alloc_size = slot
-    config.world_size = local_world
+    # Consumers reserve the same virtual stride without allocating host DRAM.
+    config.alloc_size = slot if owner_index is not None else 0
+    config.world_size = world
+    if world != local_world:
+        config.local_world_size = local_world
     config.rank_id = rank
     config.scene = entity.Scene.SHARED
     config.flags = 0  # vmm mode: dva == hva == gva, peer slots readable
-    store_url = envs.SGLANG_ENGRAM_OFFLOAD_STORE_URL.get()
     if store_url:
         try:
             config.store_url = store_url
@@ -294,9 +357,10 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
             "config (check SGLANG_ENGRAM_OFFLOAD_STORE_URL)"
         )
 
-    # One whole-slot malloc; the chunks are carved at the fixed offsets above.
-    slot_base = entity.malloc(slot, 0)
-    if slot_base == 0:
+    # One whole-slot malloc; the chunks are carved at the fixed offsets above
+    # so a peer chunk is one registered slot stride away.
+    slot_base = entity.malloc(slot, 0) if owner_index is not None else 0
+    if owner_index is not None and slot_base == 0:
         raise RuntimeError(
             f"[engram_offload] offload.malloc({slot}) failed: host DRAM "
             "exhausted for the engram pool"
@@ -305,12 +369,11 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
     ret = entity.register_entry_table(entry_bytes, used // entry_bytes)
     if ret != 0:
         raise RuntimeError(f"[engram_offload] register_entry_table failed ({ret})")
-
     tables = []
     for layer_hash_index, (block_offset, rows, num_embeddings) in enumerate(chunks):
         logger.info(
             "[engram_offload] rank %d: registered table %d (E=%d "
-            "rows_per_slot=%d block_off=%d entry=%dB)",
+            "rows_per_owner=%d block_off=%d entry=%dB)",
             rank,
             layer_hash_index,
             num_embeddings,
@@ -323,15 +386,41 @@ def _open_engram_offload(layout: EngramLayout) -> EngramOffloadManager:
                 layer_hash_index=layer_hash_index,
                 num_embeddings=num_embeddings,
                 head_dim=layout.head_dim,
-                pool_weight=_host_tensor(
-                    slot_base + block_offset, (rows, entry_bytes), torch.uint8
+                pool_weight=(
+                    _host_tensor(
+                        slot_base + block_offset, (rows, entry_bytes), torch.uint8
+                    )
+                    if owner_index is not None
+                    else torch.empty((0, entry_bytes), dtype=torch.uint8, device="cpu")
                 ),
                 rows=rows,
                 block_offset=block_offset,
                 entry_bytes=entry_bytes,
             )
         )
-    manager = EngramOffloadManager(entity, device_id, local_world, rank, slot, tables)
+    load_store = None
+    if world != local_world:
+        # P and D have independent process groups. Publish completed CPU writes
+        # through a separate store before either side captures a remote read.
+        load_store = torch.distributed.TCPStore(
+            address.hostname,
+            address.port + 1,
+            world,
+            rank == 0,
+            timeout=datetime.timedelta(minutes=30),
+            wait_for_workers=False,
+        )
+        fingerprint = repr((layout, tuple(owner_ranks))).encode()
+        load_store.set(f"layout/{rank}", fingerprint)
+        keys = [f"layout/{peer}" for peer in range(world)]
+        load_store.wait(keys)
+        if any(load_store.get(key) != fingerprint for key in keys):
+            raise ValueError(
+                "Engram pool members disagree on table layout or owner ranks"
+            )
+    manager = EngramOffloadManager(
+        entity, device_id, local_world, rank, slot, tables, owner_ranks, load_store
+    )
     # Collective: every rank of the node must leave together.
     atexit.register(manager.uninitialize)
     return manager
@@ -368,74 +457,109 @@ class _OffloadForwardBuffers:
 
 
 class NpuEngramOffloadBackend:
-    """EngramTableBackend for NPU arch35: full-replica rows in the node's
-    acc_offload SHARED pool. One instance per EngramEmbedding; all instances
+    """EngramTableBackend for A3/A5 shared DRAM. Each instance can read the
+    complete logical table. One instance per EngramEmbedding; all instances
     share the process-wide pool via get_engram_offload_manager."""
 
     full_replica = True
 
-    def __init__(self, layout: EngramLayout, dim: int, layer_id: int):
+    def __init__(
+        self, layout: EngramLayout, dim: int, layer_id: int, storage: dict | None = None
+    ):
         layer_hash_index = layout.layer_ids.index(layer_id)
         self._layer_hash_index = layer_hash_index
         self._dim = dim
         self._n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+        self._code_dtype = torch.int8 if storage is not None else torch.float8_e4m3fn
+        self._packed = is_ascend_910c()
         self._manager = get_engram_offload_manager(layout)
         self._table = self._manager.table(layer_hash_index)
-        # The chunk index is the node-local pool rank (dp replicas included),
-        # not the global tp_rank.
-        self.rows = self._table.rows
-        self.row_start = self._manager.rank * self.rows
+        # Chunk position follows owner_ranks, which may span P/D instances;
+        # consumers keep zero rows and only map the owners' table chunks.
+        self.rows = self._table.rows if self._manager.owner_index is not None else 0
+        self.row_start = (self._manager.owner_index or 0) * self._table.rows
         self._finalized = False
         self._buffers: Optional[_OffloadForwardBuffers] = None
         self._calls = 0
         self._embed: Optional[nn.Module] = None
         self._scale: Optional[torch.Tensor] = None
+        self._mapped_bases: Optional[torch.Tensor] = None
         self._staging_weight: Optional[torch.Tensor] = None
+        self._staging_scale: Optional[torch.Tensor] = None
 
     def install_params(self, embed: nn.Module) -> None:
         """Create the parameter surface on the framework module: the weight is
         meta (load_weights still routes through it; the checkpoint slice lands
-        in pinned staging that finish_load flushes into the GVA pool) and the
-        128x smaller e8m0 scale table stays device-resident in full — every
-        rank gathers arbitrary rows, so no rank can hold only a shard."""
+        in pinned staging that finish_load flushes into the GVA pool). A3 packs
+        the corresponding scale chunks beside the codes. A5 retains the full
+        E8M0 scale table in HBM because every rank gathers arbitrary rows."""
         self._embed = embed
+        self._device = torch.empty(0).device
         embed.rows = self.rows
         embed.row_start = self.row_start
         embed.weight = nn.Parameter(
-            torch.empty(self.rows, self._dim, dtype=torch.float8_e4m3fn, device="meta"),
+            torch.empty(self.rows, self._dim, dtype=self._code_dtype, device="meta"),
             requires_grad=False,
         )
         embed.weight.weight_loader = self._load_weight_rows
         self._staging_weight = torch.empty(
             self.rows,
             self._dim,
-            dtype=torch.float8_e4m3fn,
+            dtype=self._code_dtype,
             device="cpu",
             pin_memory=True,
         )
         embed.scale = nn.Parameter(
             torch.empty(
-                self._table.num_embeddings,
+                self.rows if self._packed else self._table.num_embeddings,
                 self._dim // FP8_BLOCK_SIZE,
                 dtype=torch.float8_e8m0fnu,
+                device="meta" if self._packed else self._device,
             ),
             requires_grad=False,
         )
         embed.scale.weight_loader = self._load_scale_rows
         self._scale = embed.scale
+        if self._packed:
+            self._staging_scale = torch.empty(
+                (self.rows, self._dim // FP8_BLOCK_SIZE),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            query = getattr(self._manager._entity, "get_mapped_pool", None)
+            base, stride = query() if query is not None else (0, 0)
+            if not base or stride != self._manager.slot:
+                raise RuntimeError(
+                    "A3 Engram offload requires MemFabric mapped-pool support"
+                )
+            self._mapped_bases = torch.tensor(
+                [
+                    base + rank * stride + self._table.block_offset
+                    for rank in self._manager.owner_ranks
+                ],
+                dtype=torch.int64,
+                device=self._device,
+            )
         logger.info(
             "[engram_offload] rank %d: layer %d OFFLOAD mode engaged "
             "(E=%d chunk_rows=%d entry=%dB block_off=%d; "
-            "weight meta + pinned staging, fp8 weight + scale device-resident)",
+            "weight meta + pinned staging, mapped=%s code_dtype=%s)",
             self._manager.rank,
             self._layer_hash_index,
             self._table.num_embeddings,
             self.rows,
             self._table.entry_bytes,
             self._table.block_offset,
+            self._packed,
+            self._code_dtype,
         )
 
     def _load_weight_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if loaded_weight.dtype != self._code_dtype:
+            raise ValueError(
+                f"Engram checkpoint dtype {loaded_weight.dtype} differs from configured {self._code_dtype}"
+            )
         rows = loaded_weight[self.row_start : self.row_start + self.rows]
         # The last chunk can be shorter than self.rows (ceil sharding); the
         # unbacked tail is never addressed, but zero it so the pool chunk
@@ -446,7 +570,13 @@ class NpuEngramOffloadBackend:
             self._staging_weight[rows.shape[0] :].view(torch.uint8).zero_()
 
     def _load_scale_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight)
+        if self._packed:
+            rows = loaded_weight[self.row_start : self.row_start + self.rows]
+            self._staging_scale[: rows.shape[0]].copy_(rows.view(torch.uint8))
+            if rows.shape[0] < self.rows:
+                self._staging_scale[rows.shape[0] :].zero_()
+        else:
+            param.data.copy_(loaded_weight)
 
     def finish_load(self, label: str) -> None:
         """Flush the pinned staging chunk into the GVA pool and pre-size the
@@ -458,8 +588,14 @@ class NpuEngramOffloadBackend:
             "install_params must run before finish_load"
         )
         if self._staging_weight is not None:
-            self._table.pool_weight.copy_(self._staging_weight.view(torch.uint8))
+            self._table.pool_weight[:, : self._dim].copy_(
+                self._staging_weight.view(torch.uint8)
+            )
             self._staging_weight = None
+        if self._staging_scale is not None:
+            self._table.pool_weight[:, self._dim :].copy_(self._staging_scale)
+            self._staging_scale = None
+        self._manager.finish_load(self._layer_hash_index)
         self._finalized = True
         logger.info(
             "[engram_offload] rank %d: %s weight chunk flushed to GVA pool "
@@ -470,6 +606,9 @@ class NpuEngramOffloadBackend:
             self._table.entry_bytes,
             self._table.block_offset,
         )
+        if self._mapped_bases is not None:
+            return
+        self._manager.prepare_owners(self._scale.device)
         # Size the fixed buffers ONCE for the largest batch any phase can
         # produce: captured graphs bake these addresses into their launches,
         # so a later realloc would leave smaller graphs with dangling pointers.
@@ -533,6 +672,20 @@ class NpuEngramOffloadBackend:
     def gather(self, indices: torch.Tensor) -> torch.Tensor:
         """indices [T, n_hash_cols] -> bf16 [T, n_hash_cols, head_dim]."""
         assert self._finalized, "engram offload rows are not flushed yet"
+        if self._mapped_bases is not None:
+            from sglang.kernels.ops.embeddings.engram_mapped_gather import (
+                mapped_engram_gather,
+            )
+
+            return mapped_engram_gather(
+                self._mapped_bases,
+                indices,
+                self._table.rows,
+                self._table.num_embeddings,
+                self._dim,
+                FP8_BLOCK_SIZE,
+                self._code_dtype == torch.float8_e4m3fn,
+            )
         num_tokens, num_cols = indices.shape
         count = indices.numel()
         if count == 0:
@@ -578,7 +731,7 @@ class NpuEngramOffloadBackend:
         # e8m0 cast op). Each staged entry is exactly one unpadded fp8 row;
         # the scale table is device-resident in full.
         rows = (
-            staged.view(torch.float8_e4m3fn)
+            staged.view(self._code_dtype)
             .reshape(num_tokens, num_cols, self._table.head_dim)
             .float()
             .unflatten(-1, (-1, FP8_BLOCK_SIZE))
